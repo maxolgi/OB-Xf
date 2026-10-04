@@ -19,6 +19,9 @@
 #ifndef OBXF_SRC_ENGINE_SYNTHENGINE_H
 #define OBXF_SRC_ENGINE_SYNTHENGINE_H
 
+// OctOBX PCM
+#include <cstdlib>
+
 #include <core/Constants.h>
 #include "Voice.h"
 #include "Motherboard.h"
@@ -28,11 +31,12 @@
 class SynthEngine
 {
   private:
+// OctOBX PCM: when synth.pcmVoiceOverride is set, stamp ONLY that voice (for per-layer param application)
 #define ForEachVoice(expr)                                                                         \
-    for (int i = 0; i < MAX_VOICES; i++)                                                           \
-    {                                                                                              \
-        synth.voices[i].expr;                                                                      \
-    }
+    do {                                                                                           \
+        if (synth.pcmVoiceOverride) { synth.pcmVoiceOverride->expr; }                              \
+        else { for (int i = 0; i < MAX_VOICES; i++) { synth.voices[i].expr; } }                    \
+    } while (0)
 
     Motherboard synth;
     Smoother cutoffSmoother;
@@ -72,7 +76,11 @@ class SynthEngine
     {
     }
 
-    ~SynthEngine() {}
+    // OctOBX PCM: engine deletion (obxd_init / recreate_engine in
+    // main_obxd.cpp) must release the PCM bank; destructors of members
+    // (incl. synth) run after this body, so quenching voices and freeing
+    // the pcmBank here is safe.
+    ~SynthEngine() { clearPcm(); }
 
     void setPlayHead(float bpm, float retrPos, bool resetPosition)
     {
@@ -123,9 +131,13 @@ class SynthEngine
             {
                 const auto resMod = v.matrixAdjustments.modFor(MatrixTarget::FilterResonance);
 
-                v.par.filter.cutoff = co;
-                v.filter.setResonance(resMod == 0.f ? unmodulatedRes : resScale.apply(re + resMod));
-                v.filter.setMultimode(fm);
+                // OctOBX PCM extension: PCM voices keep their own independent filter params
+                if (!v.pcmActive)
+                {
+                    v.par.filter.cutoff = co;
+                    v.filter.setResonance(resMod == 0.f ? unmodulatedRes : resScale.apply(re + resMod));
+                    v.filter.setMultimode(fm);
+                }
                 v.pitchBend = pb;
             }
         }
@@ -618,6 +630,89 @@ class SynthEngine
     {
         const auto v = linsc(val, 0.f, 0.67f);
         ForEachVoice(par.slop.level = v);
+    }
+
+    // OctOBX PCM configuration
+    void loadPcmSample(int pad, int layer, float* data, int len)
+    {
+        if (pad < 0 || pad >= 8 || layer < 0 || layer >= 4) return;
+        auto& L = synth.pcmBank[pad][layer];
+        // OctOBX PCM: free-on-overwrite. pcmBank owns the previous buffer
+        // (malloc'd by the JS worklet via _malloc). Quench any voices still
+        // playing it first — same pattern as clearPcm() — otherwise
+        // ProcessSample() would dereference freed memory until the amp
+        // envelope tails out.
+        if (L.data)
+        {
+            for (int i = 0; i < MAX_VOICES; i++)
+            {
+                if (synth.voices[i].pcmActive && synth.voices[i].pcmData == L.data)
+                {
+                    synth.voices[i].NoteOff(0.f);
+                    synth.voices[i].pcmActive = false;
+                    synth.voices[i].pcmData = nullptr;
+                    synth.voices[i].pcmLen = 0;
+                }
+            }
+            std::free(L.data);
+        }
+        L.data = data;
+        L.len = len;
+    }
+    void setPcmLayerParams(int pad, int layer, float gain,
+        float cutoff, float res, float mode,
+        float aA, float aD, float aS, float aR, float pan, float pitch)
+    {
+        if (pad < 0 || pad >= 8 || layer < 0 || layer >= 4) return;
+        auto& L = synth.pcmBank[pad][layer];
+        L.gain = gain; L.cutoff = cutoff; L.resonance = res; L.filterMode = mode;
+        L.ampAtt = aA; L.ampDec = aD; L.ampSus = aS; L.ampRel = aR; L.pan = pan; L.pitch = pitch;
+    }
+    void setPcmNoteMap(int note, int pad)
+    {
+        if (note < 0 || note >= 128 || pad < 0 || pad >= 8) return;
+        synth.pcmNoteToPad[note] = pad;
+    }
+    void setPcmLayerCount(int pad, int count)
+    {
+        if (pad < 0 || pad >= 8) return;
+        if (count < 0 || count > 4) return;
+        synth.pcmLayerCount[pad] = count;
+    }
+    void setPcmChokeGroup(int pad, int group)
+    {
+        if (pad < 0 || pad >= 8) return;
+        synth.pcmChokeGroup[pad] = group;
+    }
+    void clearPcm()
+    {
+        // Cut any voices still referencing PCM buffers before we free them,
+        // otherwise processSample() would dereference a dangling v->pcmData.
+        for (int i = 0; i < MAX_VOICES; i++)
+        {
+            if (synth.voices[i].pcmActive)
+            {
+                synth.voices[i].NoteOff(0.f);
+                synth.voices[i].pcmActive = false;
+                synth.voices[i].pcmData = nullptr;
+                synth.voices[i].pcmLen = 0;
+            }
+        }
+        for (int pad = 0; pad < 8; pad++)
+        {
+            for (int layer = 0; layer < 4; layer++)
+            {
+                if (synth.pcmBank[pad][layer].data)
+                {
+                    std::free(synth.pcmBank[pad][layer].data);
+                    synth.pcmBank[pad][layer].data = nullptr;
+                    synth.pcmBank[pad][layer].len = 0;
+                }
+            }
+        }
+        std::memset(synth.pcmNoteToPad, -1, sizeof(synth.pcmNoteToPad));
+        for (int p = 0; p < 8; p++) synth.pcmLayerCount[p] = 0;
+        for (int p = 0; p < 8; p++) synth.pcmChokeGroup[p] = -1;
     }
 };
 

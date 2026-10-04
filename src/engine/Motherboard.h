@@ -90,6 +90,30 @@ class Motherboard
 
     std::array<int32_t, 128> debugNoteOn{}, debugNoteOff{};
 
+    // ── OctOBX PCM sample bank ────────────────────────────────────
+    struct PcmLayerDef {
+        float* data{nullptr};
+        int    len{0};
+        float  gain{5.f};
+        float  cutoff{1.f};       // normalized 0..1 (same space as processFilterCutoff)
+        float  resonance{0.f};    // normalized 0..1
+        float  filterMode{0.f};   // normalized 0..1
+        float  ampAtt{0.f};       // normalized 0..1 (logsc'd at assignment)
+        float  ampDec{0.3f};
+        float  ampSus{1.f};
+        float  ampRel{0.3f};
+        float  pan{0.5f};
+        float  pitch{1.f};        // playback rate multiplier (1.0 = original)
+    };
+    PcmLayerDef pcmBank[8][4];           // 8 pads × 4 layers
+    int   pcmNoteToPad[128];             // MIDI note → pad index (-1 = none)
+    int   pcmLayerCount[8]{};            // active layers per pad (0 = pad is PCM-off)
+    int   pcmChokeGroup[8]{};            // -1 = none, 0..7 = choke group
+    // ── OctOBX PCM: single-voice override — when set, ForEachVoice stamps only this voice ──
+    Voice* pcmVoiceOverride{nullptr};
+    // ───────────────────────────────────────────────────────────────────────────────────────
+    // ──────────────────────────────────────────────────────────────────────
+
     Motherboard() : left(), right()
     {
         for (int i = 0; i < 129; i++)
@@ -98,6 +122,12 @@ class Motherboard
             stolenVoicesChannelForMIDIKey[i] = 0;
             voiceAgeForPriority[i] = 0;
         }
+
+        // OctOBX PCM: default note map = unmapped, choke groups = none
+        for (int i = 0; i < 128; i++)
+            pcmNoteToPad[i] = -1;
+        for (int i = 0; i < 8; i++)
+            pcmChokeGroup[i] = -1;
 
         globalLFO = LFO();
         vibratoLFO = LFO();
@@ -444,6 +474,37 @@ class Motherboard
         return false;
     }
 
+    // ── OctOBX PCM: assign a specific pad/layer to a voice (independent synth chain) ──
+    void assignPcmLayer(Voice* v, int pad, int layer)
+    {
+        if (pad < 0 || pad >= 8 || layer < 0 || layer >= 4) { v->pcmActive = false; return; }
+        auto& L = pcmBank[pad][layer];
+
+        v->pcmActive = true;
+        v->pcmData = L.data;
+        v->pcmLen = L.len;
+        v->pcmPos = 0.f;
+        v->pcmGain = L.gain;
+        v->pcmPan = L.pan;
+        v->pcmRate = L.pitch;
+        v->pcmChokeGroup = pcmChokeGroup[pad];
+        v->pcmPadId = pad;
+        v->pcmLayerId = layer;       // OctOBX PCM: remember layer for full-param application
+        v->pcmNeedsParams = true;    // OctOBX PCM: main_obxd applies the layer's params next
+
+        // OctOBX PCM: independent filter params (NOT overwritten by SynthEngine — see pcmActive guard)
+        v->par.filter.cutoff = L.cutoff * 120.f;  // linsc(cutoff, 0, 120)
+        v->filter.setResonance(0.991f - logsc(1.f - L.resonance, 0.f, 0.991f, 40.f));
+        v->filter.setMultimode(L.filterMode);
+
+        // OctOBX PCM: independent amp envelope
+        v->ampEnv.setAttack(logsc(L.ampAtt, 4.f, 60000.f, 900.f));
+        v->ampEnv.setDecay(logsc(L.ampDec, 4.f, 60000.f, 900.f));
+        v->ampEnv.setSustain(L.ampSus);
+        v->ampEnv.setRelease(logsc(L.ampRel, 8.f, 60000.f, 900.f));
+    }
+    // ─────────────────────────────────────────────────────────────────────────────────
+
     void setNoteOn(int note, float velocity, int8_t channel)
     {
         anySounding = true;
@@ -451,6 +512,56 @@ class Motherboard
 
         // This played note has the highest as-played priority
         voiceAgeForPriority[note] = asPlayedCounter++;
+
+        // ── OctOBX PCM: layered sampler — all enabled layers trigger at once ──
+        int pcmPad = (note >= 0 && note < 128) ? pcmNoteToPad[note] : -1;
+        if (pcmPad >= 0 && pcmLayerCount[pcmPad] > 0)
+        {
+            // OctOBX PCM: Choke — cut voices in the same group belonging to OTHER pads
+            if (pcmChokeGroup[pcmPad] >= 0)
+            {
+                for (int j = 0; j < totalVoiceCount; j++)
+                {
+                    if (voices[j].isSounding() && voices[j].pcmChokeGroup == pcmChokeGroup[pcmPad]
+                        && voices[j].pcmPadId != pcmPad)
+                    {
+                        voices[j].NoteOff(0.f);
+                    }
+                }
+            }
+
+            int pcmNeeded = std::min(pcmLayerCount[pcmPad], totalVoiceCount);
+            int pcmLayerIdx = 0;
+
+            // OctOBX PCM: Pass 1 — use free (non-gated) voices
+            for (int i = 0; i < totalVoiceCount && pcmNeeded > 0; i++)
+            {
+                Voice* v = voiceQueue.getNext();
+                if (!v->isGated())
+                {
+                    v->NoteOn(note, velocity, channel);
+                    recalculateMatrix(voiceMatrix, v->matrixSourceValues, v->matrixAdjustments);
+                    assignPcmLayer(v, pcmPad, pcmLayerIdx++);
+                    lastAllocatedIdx = v->voiceIndex;
+                    pcmNeeded--;
+                }
+            }
+
+            // OctOBX PCM: Pass 2 — steal oldest sounding voices (chosen voice-starve policy)
+            while (pcmNeeded > 0)
+            {
+                Voice* v = nextVoiceToBeStolen();
+                if (!v) break;
+                v->NoteOn(note, velocity, channel);
+                recalculateMatrix(voiceMatrix, v->matrixSourceValues, v->matrixAdjustments);
+                assignPcmLayer(v, pcmPad, pcmLayerIdx++);
+                pcmNeeded--;
+            }
+
+            dumpVoiceStatus("NoteOn");
+            return;
+        }
+        // ─────────────────────────────────────────────────────────────────────────────
 
         // And toggle on unison if it was off
         if (wasUnisonSet != unison)
@@ -593,7 +704,8 @@ class Motherboard
             {
                 Voice *p = voiceQueue.getNext();
 
-                if (p->midiNote == note && p->isGated())
+                // OctOBX PCM
+                if (p->midiNote == note && p->isGated() && !p->pcmActive)
                 {
                     p->NoteOn(mk, Voice::reuseVelocitySentinel,
                               mpeEnabled ? stolenVoicesChannelForMIDIKey[mk] : p->channel);
@@ -762,12 +874,16 @@ class Motherboard
             {
                 float x2 = processSynthVoice(voices[i], lfovalue2, viblfo2);
 
-                vlo += x2 * (1 - pannings[i % MAX_PANNINGS]);
-                vro += x2 * (pannings[i % MAX_PANNINGS]);
+                // OctOBX PCM: per-voice pan override
+                float pcmPan_i = voices[i].pcmActive ? voices[i].pcmPan : pannings[i % MAX_PANNINGS];
+                vlo += x2 * (1 - pcmPan_i);
+                vro += x2 * (pcmPan_i);
             }
 
-            vl += x1 * (1 - pannings[i % MAX_PANNINGS]);
-            vr += x1 * (pannings[i % MAX_PANNINGS]);
+            // OctOBX PCM: per-voice pan override
+            float pcmPan_i = voices[i].pcmActive ? voices[i].pcmPan : pannings[i % MAX_PANNINGS];
+            vl += x1 * (1 - pcmPan_i);
+            vr += x1 * (pcmPan_i);
         }
 
         if (oversample)
