@@ -540,7 +540,8 @@ class Motherboard
                 if (!v->isGated())
                 {
                     v->NoteOn(note, velocity, channel);
-                    recalculateMatrix(voiceMatrix, v->matrixSourceValues, v->matrixAdjustments);
+                    recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                      v->matrixAdjustments);
                     assignPcmLayer(v, pcmPad, pcmLayerIdx++);
                     lastAllocatedIdx = v->voiceIndex;
                     pcmNeeded--;
@@ -553,7 +554,8 @@ class Motherboard
                 Voice* v = nextVoiceToBeStolen();
                 if (!v) break;
                 v->NoteOn(note, velocity, channel);
-                recalculateMatrix(voiceMatrix, v->matrixSourceValues, v->matrixAdjustments);
+                recalculateMatrix(voiceMatrix, matrixBases, v->matrixSourceValues,
+                                  v->matrixAdjustments);
                 assignPcmLayer(v, pcmPad, pcmLayerIdx++);
                 pcmNeeded--;
             }
